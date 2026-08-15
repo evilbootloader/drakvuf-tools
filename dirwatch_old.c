@@ -127,10 +127,6 @@
 
 #define UNUSED(x) (void)(x)
 
-static gboolean valid_threadid(int threadid);
-
-static inline void release_thread(int threadid);
-
 struct start_drakvuf
 {
     int threadid;
@@ -164,7 +160,6 @@ xen_interface_t* xen;
 
 void close_handler(int signal)
 {
-    printf("** SHUTTING DOWN **\n");
     shutting_down = signal;
 }
 
@@ -190,6 +185,14 @@ gpointer tcpdump(gpointer data)
     g_spawn_command_line_sync(command, NULL, NULL, NULL, NULL);
     g_free(command);
     return NULL;
+}
+
+static inline void release_thread(int threadid)
+{
+    if (threadid < 0 || (guint)threadid >= threads)
+        return;
+
+    g_atomic_int_set(&slots_busy[threadid], 0);
 }
 
 static inline int find_thread(void)
@@ -243,20 +246,31 @@ gpointer timer_thread(gpointer data)
     return NULL;
 }
 
-static struct start_drakvuf* prepare(struct start_drakvuf* start, int requested_threadid)
+static gboolean valid_threadid(int threadid)
+{
+    return threadid >= 0 &&
+           (guint)threadid < threads;
+}
+
+static struct start_drakvuf*
+prepare(struct start_drakvuf* start, int requested_threadid)
 {
     gboolean allocated_here = FALSE;
 
     if (shutting_down)
         return NULL;
 
-    domid_t cloneID = 0;
-    char* clone_name = NULL;
-    int threadid = start ? start->threadid : requested_threadid;
+    int threadid = start
+        ? start->threadid
+        : requested_threadid;
 
     if (!valid_threadid(threadid))
     {
-        fprintf(stderr, "[!] Refusing to create clone with invalid thread ID %d (threads=%u)\n", threadid, threads);
+        fprintf(stderr,
+                "[!] Refusing to create clone with invalid thread ID %d "
+                "(threads=%u)\n",
+                threadid,
+                threads);
 
         return NULL;
     }
@@ -270,7 +284,9 @@ static struct start_drakvuf* prepare(struct start_drakvuf* start, int requested_
 
         if (!start)
         {
-            fprintf(stderr, "[%i] Failed to allocate start_drakvuf\n", threadid);
+            fprintf(stderr,
+                    "[%i] Failed to allocate start_drakvuf\n",
+                    threadid);
             return NULL;
         }
 
@@ -290,20 +306,17 @@ static struct start_drakvuf* prepare(struct start_drakvuf* start, int requested_
 
     while (!shutting_down)
     {
-        
+        domid_t cloneID = 0;
+        char* clone_name = NULL;
 
         printf("[%i] Making clone\n", threadid);
 
-        make_clone(xen, &cloneID, threadid + 1, &clone_name);
-
-        if (shutting_down)
-        {
-            if (cloneID != 0)
-                cleanup(cloneID, threadid + 1);
-
-            g_clear_pointer(&clone_name, g_free);
-            break;
-        }
+        make_clone(
+            xen,
+            &cloneID,
+            threadid + 1,
+            &clone_name
+        );
 
         if (cloneID != 0 && clone_name != NULL)
         {
@@ -311,7 +324,10 @@ static struct start_drakvuf* prepare(struct start_drakvuf* start, int requested_
             start->clone_name = clone_name;
             start->utime = time(NULL);
 
-            printf("[%i] Clone %s created with domid %u\n", threadid, start->clone_name, start->cloneID);
+            printf("[%i] Clone %s created with domid %u\n",
+                   threadid,
+                   start->clone_name,
+                   start->cloneID);
 
             return start;
         }
@@ -325,9 +341,8 @@ static struct start_drakvuf* prepare(struct start_drakvuf* start, int requested_
         if (cloneID != 0)
             cleanup(cloneID, threadid + 1);
 
-        g_clear_pointer(&clone_name, g_free);
+        g_free(clone_name);
 
-        cloneID = 0;
         /*
          * Avoid continuously hammering Xen/LVM on failure.
          */
@@ -346,8 +361,6 @@ static struct start_drakvuf* prepare(struct start_drakvuf* start, int requested_
 
     return NULL;
 }
-
-
 static inline void start(struct start_drakvuf* start, char* sample)
 {
     if ( shutting_down || !start || !sample )
@@ -378,8 +391,7 @@ restart:
     command = g_strdup_printf(CONFIG_CMD, config_script, json_kernel_path, start->cloneID, injection_pid, start->threadid+1, run_folder, start->input, out_folder, start->utime);
     printf("[%i] ** RUNNING COMMAND: %s\n", start->threadid, command);
     g_spawn_command_line_sync(command, NULL, NULL, &rc, NULL);
-    
-    g_clear_pointer(&command, g_free);
+    g_free(command);
 
     g_mutex_unlock(&start->timer_lock);
     g_thread_join(timer);
@@ -406,35 +418,39 @@ restart:
 
     printf("[%i] ** DRAKVUF finished with RC %i. Timer: %i\n", start->threadid, rc, start->timer);
 
-    if (start->timer)
+        if (start->timer)
     {
-        printf("[%i] Finished processing %s\n", start->threadid, start->input);
+        printf("[%i] Finished processing %s\n",
+               start->threadid,
+               start->input);
 
-        release_thread(start->threadid);
-
-        g_mutex_clear(&start->timer_lock);
-        g_clear_pointer(&start->input, g_free);
-        g_clear_pointer(&start->clone_name, g_free);
-        g_free(start);
-        return;
-    } else {
-        cleanup(start->cloneID, start->threadid+1);
+        goto worker_finished;
     }
 
 end:
     if (!shutting_down)
     {
-        printf("[%i] %s failed to execute on %u because of a timeout, creating new clone\n", start->threadid, start->input, start->cloneID);
-        prepare(start, -1);
-        goto restart;
-/*
+        printf("[%i] %s timed out on %u; creating new clone\n",
+               start->threadid,
+               start->input,
+               start->cloneID);
+
+        struct start_drakvuf* prepared = prepare(start, -1);
+
         if (prepared)
         {
             start = prepared;
             goto restart;
         }
-*/
     }
+
+worker_finished:
+    release_thread(start->threadid);
+
+    g_mutex_clear(&start->timer_lock);
+    g_clear_pointer(&start->input, g_free);
+    g_clear_pointer(&start->clone_name, g_free);
+    g_free(start);
 }
 
 int main(int argc, char** argv)
@@ -483,7 +499,7 @@ int main(int argc, char** argv)
     cleanup_script = argv[13];
     tcpdump_script = argv[14];
 
-    if (threads <= 0 || threads > 128)
+    if (threads == 0 || threads > 128)
     {
         printf("Invalid clone count %u (valid range: 1-128)\n", threads);
         return 1;
@@ -544,7 +560,8 @@ int main(int argc, char** argv)
 
                 if (!_start)
                 {
-                    fprintf(stderr, "[%i] Unable to prepare clone for %s; " 
+                    fprintf(stderr,
+                            "[%i] Unable to prepare clone for %s; "
                             "leaving it in the input directory\n",
                             threadid,
                             ent->d_name);
@@ -560,10 +577,13 @@ int main(int argc, char** argv)
 
                 char* command;
                 gint move_rc = -1;
-                command = g_strdup_printf("mv %s/%s %s/%s", in_folder, ent->d_name, run_folder, ent->d_name);
+                command = g_strdup_printf("mv %s/%s %s/%s",
+                                          in_folder, ent->d_name,
+                                          run_folder, ent->d_name);
                 printf("** MOVING FILE FOR PROCESSING: %s\n", command);
-                gboolean move_started = g_spawn_command_line_sync(command, NULL, NULL, &move_rc, NULL);
-                g_clear_pointer(&command, g_free);
+                gboolean move_started = g_spawn_command_line_sync(
+                    command, NULL, NULL, &move_rc, NULL);
+                g_free(command);
 
                 if (!move_started || move_rc != 0)
                 {
@@ -647,16 +667,4 @@ int main(int argc, char** argv)
     return ret;
 }
 
-static inline void release_thread(int threadid)
-{
-    if (threadid < 0 || (guint)threadid >= threads)
-        return;
 
-    g_atomic_int_set(&slots_busy[threadid], 0);
-}
-
-static gboolean valid_threadid(int threadid)
-{
-    return threadid >= 0 &&
-           (guint)threadid < threads;
-}

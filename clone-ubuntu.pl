@@ -1,3 +1,5 @@
+#!/usr/bin/perl
+#
 #********************IMPORTANT DRAKVUF LICENSE TERMS*********************#
 #                                                                        #
 # DRAKVUF (C) 2014-2024 Tamas K Lengyel.                                 #
@@ -101,27 +103,201 @@
 # https://github.com/tklengyel/drakvuf/COPYING)                          #
 #                                                                        #
 #************************************************************************#
-#!/bin/bash
 
-ARGC=$#
-if [ $ARGC -le 6 ]; then
-    exit 0;
-fi
+######
+# Creates a disposable analysis clone of the sandbox template domain:
+#   1. an LVM copy-on-write snapshot of the origin's LV, and
+#   2. `xl restore` of the origin's previously saved memory image,
+# into a rewritten Xen config (own name, own per-VLAN vif, own disk).
+#
+# The origin is passed as an argument (e.g. ubuntu_sandbox, not the golden
+# ubuntu) and its LVM volume must share that name. The saved memory image
+# is produced out-of-band, once per sandbox template -- see
+# docs/checklists/ubuntu.md and docs/checklists/android.md.
+#
+# The memory image used to be a hard-coded /home/user/Documents path while
+# the origin was a parameter, so the two had to be kept in agreement by
+# hand or a clone got one domain's disk with another's memory. Issue #4
+# removed that class of mistake rather than documenting it: the path is
+# now derived from the origin argument, as
+# "<repo root>/state/<origin>.bak", so disk and memory cannot name
+# different domains. dirwatch passes no extra argument for it -- its
+# CLONE_CMD is a fixed `<script> <origin> <vlan> <config>`
+# (dirwatch.c:122) -- which is why this is derived rather than passed.
+#
+# NOTICE:
+# If an LVM volume exists with the clone's name, it is removed.
+#
+use strict;
+use warnings;
 
-REKALL=$1
-DOMAIN=$2
-PID=$3
-VLAN=$4
-RUNFOLDER=$5
-RUNFILE=$6
-OUTPUTFOLDER=$7
-MD5=$(md5sum $RUNFOLDER/$RUNFILE | awk -F" " '{print $1}')
-USER="carlos"
-CMD="/usr/bin/sh"
-ARG1="-c" 
-ARG2="sudo ip addr flush dev eth0 && sudo ip addr add 172.16.$VLAN.2/24 dev eth0 && sudo ip route replace default via 172.16.$VLAN.1 dev eth0 && echo 'nameserver 172.16.$VLAN.1' | sudo tee /etc/resolv.conf && wget 'http://172.16.$VLAN.1/$RUNFILE' -O '/home/$USER/Desktop/test' && chmod +x '/home/$USER/Desktop/test'"
+# RealBin, not Bin: DEPLOY keeps the old ~/drakvuf-tools path alive as a
+# symlink during the transition, and the state/ directory belongs to the
+# real checkout, not to whatever alias invoked this script.
+use FindBin;
 
-mkdir -p $OUTPUTFOLDER/$MD5 1>/dev/null 2>&1
-injector -r $REKALL -d $DOMAIN -i $PID -m execproc -e "$CMD" -f "$ARG1" -f "$ARG2" 1>$OUTPUTFOLDER/$MD5/preconfig.log 2>&1
+## Settings
+#
+# The LVM volume group
+our $lvm_vg = "vg-root";
 
-exit $?;
+# Clone network bridge name
+our $clone_bridge = "xenbr1";
+
+# vif options merged into the clone's Xen config. Any bridge=, script= or
+# backend= inherited from the origin's config is stripped first (see the
+# vif rewrite in clone()), then these options plus bridge=<bridge>.<vlan>
+# are appended -- so a clone always lands on its own VLAN sub-interface
+# regardless of what the origin config said.
+our $vif_script = "script=vif-openvswitch";
+
+############################################################
+
+our $lvcreate  = `which lvcreate`;
+our $lvremove  = `which lvremove`;
+our $lvdisplay = `which lvdisplay`;
+our $xl        = `which xl`;
+our $mkfifo    = `which mkfifo`;
+
+$lvcreate  =~ s/\015?\012?$//;
+$lvremove  =~ s/\015?\012?$//;
+$lvdisplay =~ s/\015?\012?$//;
+$xl        =~ s/\015?\012?$//;
+$mkfifo    =~ s/\015?\012?$//;
+
+sub clone {
+    if (@ARGV != 3) {
+        die "Insufficient number of arguments!\n"
+          . "Usage: ./clone.pl <domain name> <vlan> <path/to/domain.cfg>\n";
+    }
+
+    my $origin = $_[0];
+    my $vlan   = $_[1];
+    my $config = $_[2];
+    my $clone  = "$origin-$vlan-clone";
+
+    my $clone_test = `$xl domid $clone 2>/dev/null`;
+    if (length $clone_test) {
+        `$xl destroy $clone`;
+    }
+
+    unless (-e $config) {
+        die "0";
+    }
+
+    my $domconfig = `cat $config`;
+
+    open(my $fh, '>', "/tmp/$clone.config")
+        or die "Could not open file!";
+
+    while ($domconfig =~ /([^\n]+)\n?/g) {
+        my $line = $1;
+
+        if ($line =~ /^\s*name\s*=/) {
+            print $fh "name = \"$clone\"\n";
+            next;
+        }
+
+        if ($line =~ /^\s*vif\s*=/) {
+            my ($inside) = $line =~ /\[\s*['"](.+?)['"]\s*\]/;
+
+            die "Unable to parse VIF configuration: $line\n"
+                unless defined $inside;
+
+            my @values = split /,/, $inside;
+            my @new_values;
+
+            foreach my $value (@values) {
+                $value =~ s/^\s+//;
+                $value =~ s/\s+$//;
+
+                next if $value eq '';
+                next if $value =~ /^(?:bridge|script|backend)\s*=/;
+
+                push @new_values, $value;
+            }
+
+            if (defined $vif_script && length $vif_script) {
+                foreach my $option (split /,/, $vif_script) {
+                    $option =~ s/^\s+//;
+                    $option =~ s/\s+$//;
+
+                    push @new_values, $option if length $option;
+                }
+            }
+
+            push @new_values, "bridge=$clone_bridge.$vlan";
+
+            print $fh "vif = [ '" . join(',', @new_values) . "' ]\n";
+            next;
+        }
+
+        if ($line =~ /^\s*disk\s*=/) {
+            print $fh
+                "disk = [ 'phy:/dev/$lvm_vg/$clone,hda,w' ]\n";
+            next;
+        }
+
+        print $fh "$line\n";
+    }
+
+    # TODO: evaluate qemu stubdomain usability
+    #print $fh "device_model_stubdomain_override = 1\n";
+
+    close $fh;
+
+    # A disabled per-origin flock used to sit here, under the comment
+    # "only one clone process may manipulate a particular origin VM at the
+    # same time". That requirement came from upstream's clone.pl, which
+    # live-snapshots the origin domain -- the same upstream inheritance
+    # that left the wrong description in this file's header. This version
+    # never touches the origin domain at all: it only reads the origin's
+    # LV as a snapshot source, and the sole `xl destroy` above targets the
+    # clone. So the requirement as stated does not apply here.
+    #
+    # What does hold today: clone names are `<origin>-<vlan>-clone`, and
+    # dirwatch derives the vlan from a worker slot claimed with an atomic
+    # compare-and-exchange (dirwatch.c), so two concurrent workers can
+    # never generate the same clone name. Raising the clone count does not
+    # change that.
+    #
+    # KNOWN GAP (DRAFT-033), narrower than the old comment implied:
+    #   - Nothing checks the exit status of the destroy/lvremove/lvcreate
+    #     sequence below, so a clone LV still held open by a domain that
+    #     has not finished dying fails silently (DRAFT-033 / DRAKVUF-06).
+    #   - Clone-name uniqueness depends on there being ONE dirwatch per
+    #     origin. dirwatch hard-codes a single origin per invocation, so a
+    #     second dirwatch started against the same origin would collide --
+    #     one command away, and worth locking against before the Android
+    #     and Windows launchers exist.
+    # The disabled flock is in git history at 7764b77.
+
+    my $test = `$lvdisplay /dev/$lvm_vg/$clone 2>&1`;
+    if (($test =~ tr/\n//) != 1) {
+        `$lvremove -f /dev/$lvm_vg/$clone 2>&1`;
+    }
+
+    `$lvcreate -s -n $clone -L64G /dev/$lvm_vg/$origin 2>&1`;
+
+
+    my $saved_state = "$FindBin::RealBin/../state/$origin.bak";
+
+    unless (-r $saved_state) {
+        die "Saved memory image not found or unreadable: $saved_state\n"
+          . "Expected <repo root>/state/<origin domain>.bak -- see "
+          . "docs/runbooks/deploy-repo-relative-paths.md\n";
+    }
+
+    my $error=`$xl restore -p -e /tmp/$clone.config $saved_state 2>&1`;
+    print STDERR $error;
+
+    my $cloneID = `$xl domid $clone`;
+
+    chomp($cloneID);
+
+    print "$cloneID";
+}
+
+############################################################
+
+clone($ARGV[0], $ARGV[1], $ARGV[2]);

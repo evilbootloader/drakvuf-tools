@@ -1,5 +1,4 @@
-#!/usr/bin/perl
-#
+#!/bin/sh
 #********************IMPORTANT DRAKVUF LICENSE TERMS*********************#
 #                                                                        #
 # DRAKVUF (C) 2014-2024 Tamas K Lengyel.                                 #
@@ -103,165 +102,64 @@
 # https://github.com/tklengyel/drakvuf/COPYING)                          #
 #                                                                        #
 #************************************************************************#
-
-######
-# This script creates an LVM disk CoW of the specified VM
-# then live-snapshots the VM to duplicate its memory
-# followed by memsharing to deduplicate memory.
 #
-# The LVM volume should have the same name as the domain.
+# Runs the DRAKVUF trace against a clone that preconfig-ubuntu.sh has
+# already staged. Called by dirwatch with the same fixed 7-argument list.
+
+# $0, not ${BASH_SOURCE[0]} -- this script is executed by dash, not bash,
+# because its shebang sits below the license header and GLib falls back
+# to /bin/sh on ENOEXEC. See the fuller note in preconfig-ubuntu.sh.
+SCRIPT_DIR="$(
+    cd -- "$(dirname -- "$0")" &&
+    pwd
+)"
+
+# shellcheck disable=SC2034  # read by the sourced pipeline-ubuntu.env, not here
+REPO_ROOT="$(
+    cd -- "$SCRIPT_DIR/.." &&
+    pwd
+)"
+
+# shellcheck source=automation/pipeline-ubuntu.env
+. "$SCRIPT_DIR/pipeline-ubuntu.env"
+
+ARGC=$#
+if [ $ARGC -le 6 ]; then
+    exit 0;
+fi
+
+REKALL=$1
+DOMAIN=$2
+PID=$3
+VLAN=$4
+RUNFOLDER=$5
+RUNFILE=$6
+OUTPUTFOLDER=$7
+MD5=$(md5sum -- "$RUNFOLDER/$RUNFILE" | awk -F" " '{print $1}')
+
+# The staged sample's guest path. Both this script and
+# preconfig-ubuntu.sh build it the same way -- GUEST_STAGING_DIR from
+# pipeline-ubuntu.env plus the sample's own SHA-256 -- from the same two
+# dirwatch arguments, so staging and execution cannot name different
+# files. That drift is not hypothetical: it is exactly what issue #2
+# found when this line held a literal `/home/<USER>/Desktop/test` while
+# preconfig staged to `/home/carlos/Desktop/test`.
 #
-# NOTICE:
-# If an LVM volume exists with the clone's name, it is removed.
-#
-use strict;
-use warnings;
-use Fcntl qw(:flock);
+# `-e` is execve-direct with no guest shell (issue #2), so this path is
+# resolved Dom0-side and must be exact.
+SHA256=$(sha256sum -- "$RUNFOLDER/$RUNFILE" | awk -F" " '{print $1}')
+CMD="$GUEST_STAGING_DIR/$SHA256"
 
-## Settings
-#
-# The LVM volume group
-our $lvm_vg = "vg-root";
+sleep 5 2>&1
+drakvuf -r $REKALL -d $DOMAIN -i $PID -m execproc -e "$CMD" -D $OUTPUTFOLDER/$MD5 -o json -t 120 -a syscalls -a filetracer -a fileextractor -a memdump --memdump-dir $OUTPUTFOLDER/$MD5 1>$OUTPUTFOLDER/$MD5/drakvuf.log 2>&1
 
-# Clone network bridge name
-our $clone_bridge = "xenbr1";
+RET=$?
 
-# Vif script to pass to clone Xen config.
-# The backend specifies the name of the openvswitch domain.
-our $vif_script = "script=vif-openvswitch";
+if [ $RET -eq 1 ]; then
+   mv $RUNFOLDER/$RUNFILE $OUTPUTFOLDER/$MD5 1>/dev/null 2>&1
+fi
 
-############################################################
+TCPDUMPPID=$(ps aux | grep "tcpdump -i xenbr1.$VLAN" | grep -v grep | awk -F" " '{print $2}')
+kill -9 $TCPDUMPPID 1>/dev/null 2>&1
 
-our $lvcreate  = `which lvcreate`;
-our $lvremove  = `which lvremove`;
-our $lvdisplay = `which lvdisplay`;
-our $xl        = `which xl`;
-our $mkfifo    = `which mkfifo`;
-
-$lvcreate  =~ s/\015?\012?$//;
-$lvremove  =~ s/\015?\012?$//;
-$lvdisplay =~ s/\015?\012?$//;
-$xl        =~ s/\015?\012?$//;
-$mkfifo    =~ s/\015?\012?$//;
-
-sub clone {
-    if (@ARGV != 3) {
-        die "Insufficient number of arguments!\n"
-          . "Usage: ./clone.pl <domain name> <vlan> <path/to/domain.cfg>\n";
-    }
-
-    my $origin = $_[0];
-    my $vlan   = $_[1];
-    my $config = $_[2];
-    my $clone  = "$origin-$vlan-clone";
-
-#    my $origin_test = `$xl domid $origin`;
-#    if (length $origin_test == 0) {
-#        die "0";
-#    }
-
-    my $clone_test = `$xl domid $clone 2>/dev/null`;
-    if (length $clone_test) {
-        `$xl destroy $clone`;
-    }
-
-    unless (-e $config) {
-        die "0";
-    }
-
-    my $domconfig = `cat $config`;
-
-    open(my $fh, '>', "/tmp/$clone.config")
-        or die "Could not open file!";
-
-    while ($domconfig =~ /([^\n]+)\n?/g) {
-        my $line = $1;
-
-        if ($line =~ /^\s*name\s*=/) {
-            print $fh "name = \"$clone\"\n";
-            next;
-        }
-
-        if ($line =~ /^\s*vif\s*=/) {
-            my ($inside) = $line =~ /\[\s*['"](.+?)['"]\s*\]/;
-
-            die "Unable to parse VIF configuration: $line\n"
-                unless defined $inside;
-
-            my @values = split /,/, $inside;
-            my @new_values;
-
-            foreach my $value (@values) {
-                $value =~ s/^\s+//;
-                $value =~ s/\s+$//;
-
-                next if $value eq '';
-                next if $value =~ /^(?:bridge|script|backend)\s*=/;
-
-                push @new_values, $value;
-            }
-
-            if (defined $vif_script && length $vif_script) {
-                foreach my $option (split /,/, $vif_script) {
-                    $option =~ s/^\s+//;
-                    $option =~ s/\s+$//;
-
-                    push @new_values, $option if length $option;
-                }
-            }
-
-            push @new_values, "bridge=$clone_bridge.$vlan";
-
-            print $fh "vif = [ '" . join(',', @new_values) . "' ]\n";
-            next;
-        }
-
-        if ($line =~ /^\s*disk\s*=/) {
-            print $fh
-                "disk = [ 'phy:/dev/$lvm_vg/$clone,hda,w' ]\n";
-            next;
-        }
-
-        print $fh "$line\n";
-    }
-
-    # TODO: evaluate qemu stubdomain usability
-    #print $fh "device_model_stubdomain_override = 1\n";
-
-    close $fh;
-
-    # Only one clone process may manipulate a particular origin VM
-    # at the same time.
-    #my $lock_file = "/run/lock/drakvuf-clone-$origin.lock";
-
-    #open(my $lock_fh, '>>', $lock_file)
-    #    or die "Could not open lock file $lock_file: $!\n";
-
-    #flock($lock_fh, LOCK_EX)
-    #    or die "Could not acquire lock $lock_file: $!\n";
-
-
-    my $test = `$lvdisplay /dev/$lvm_vg/$clone 2>&1`;
-    if (($test =~ tr/\n//) != 1) {
-        #print "Removing existing LVM snapshot of $clone\n";
-        `$lvremove -f /dev/$lvm_vg/$clone 2>&1`;
-    }
-
-    `$lvcreate -s -n $clone -L64G /dev/$lvm_vg/$origin 2>&1`;
-
-
-    my $error=`$xl restore -p -e /tmp/$clone.config /home/user/Documents/ubuntu_sandbox.bak 2>&1`;
-    print STDERR $error;
-#    flock($lock_fh, LOCK_UN);
-#    close($lock_fh);
-
-    my $cloneID = `$xl domid $clone`;
-
-    chomp($cloneID);
-
-    print "$cloneID";
-}
-
-############################################################
-
-clone($ARGV[0], $ARGV[1], $ARGV[2]);
+exit $RET;
